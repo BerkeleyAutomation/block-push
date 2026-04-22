@@ -1,0 +1,16 @@
+[project]
+name = "block-push"
+version = "0.1.0"
+description = "Franka cube-pushing environment in RoboSuite with attention window recording"
+requires-python = ">=3.10"
+dependencies = [
+    "robosuite>=1.5.0",
+    "numpy",
+    "scipy",
+    "imageio[ffmpeg]",
+    "opencv-python",
+    "viser",
+]
+
+[tool.uv]
+dev-dependencies = []
