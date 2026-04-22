@@ -9,11 +9,6 @@ Usage:
     uv run python run_push.py
 """
 
-import os
-# Use OSMesa for headless rendering; set before any GL/mujoco imports
-if "MUJOCO_GL" not in os.environ:
-    os.environ["MUJOCO_GL"] = "osmesa"
-
 import numpy as np
 import imageio
 

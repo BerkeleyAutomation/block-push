@@ -9,11 +9,6 @@ Usage:
 Then open http://localhost:8080 in a browser.
 """
 
-import os
-# Use OSMesa for headless rendering; set before any GL/mujoco imports
-if "MUJOCO_GL" not in os.environ:
-    os.environ["MUJOCO_GL"] = "osmesa"
-
 import sys
 import time
 import numpy as np

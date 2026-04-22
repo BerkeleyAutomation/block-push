@@ -1,6 +1,12 @@
+import os
 import numpy as np
 import xml.etree.ElementTree as ET
 from scipy.spatial.transform import Rotation
+
+# Configure MuJoCo / OpenGL backend before importing robosuite / mujoco.
+# Force EGL because OSMesa can produce intermittent black frames in this project.
+if os.environ.get("MUJOCO_GL", "").lower() != "egl":
+    os.environ["MUJOCO_GL"] = "egl"
 
 from robosuite.environments.manipulation.manipulation_env import ManipulationEnv
 from robosuite.models.arenas import TableArena

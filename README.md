@@ -86,8 +86,8 @@ block-push/
 
 ## Troubleshooting
 
-**`AttributeError: 'NoneType' object has no attribute 'eglQueryString'`** — EGL not available.  
-Install OSMesa: `sudo apt-get install -y libosmesa6-dev`. Both scripts auto-set `MUJOCO_GL=osmesa` when no backend is specified.
+**Videos turn black after a few frames** — this usually indicates an unstable OSMesa path.  
+The project now forces `MUJOCO_GL=egl` internally for stable offscreen rendering.
 
 **`No module named 'robosuite'`** — run `uv sync` first.
 
