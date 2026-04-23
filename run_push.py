@@ -1,9 +1,9 @@
 """
-run_push.py — scripted Franka cube-push from front to back with recording.
+run_push.py — hardcoded gripper-touches-cube test with recording.
 
 Outputs:
   thirdview.mp4  — 480×480 third-view camera video
-  attention.mp4  — 20×20 pixel attention window video (fixed, anchored to cube-table contact)
+  attention.mp4  — 20×20 pixel attention window cropped from the thirdview frame
 
 Usage:
     uv run python run_push.py
@@ -12,10 +12,7 @@ Usage:
 import numpy as np
 import imageio
 
-from cube_push_env import (
-    FrankaCubePushEnv,
-    TABLE_SURFACE_Z,
-)
+from cube_push_env import FrankaCubePushEnv, TABLE_SURFACE_Z
 
 # Recording settings
 FPS = 20
@@ -60,6 +57,7 @@ def run_episode(env):
     cube_pos = env.get_cube_pos()
     contact_3d = np.array([cube_pos[0], cube_pos[1], TABLE_SURFACE_Z])
     u0, v0 = env.world_to_pixel(contact_3d)
+    v0 += 99  # shift so cube bottom edge sits in top half of window
 
     print(f"Cube initial position : {cube_pos}")
     print(f"Attention window center: ({u0}, {v0}) px  [fixed for entire episode]")
@@ -88,31 +86,27 @@ def run_episode(env):
     record(obs)
 
     # ------------------------------------------------------------------
-    # Scripted push phases
+    # Scripted push phases — gripper descends onto cube top then pushes forward
     # ------------------------------------------------------------------
-    # Phase A: Move above and in front of the cube
-    print("\nPhase A: approaching above cube (front side)...")
-    approach = cube_pos + np.array([0.0, -0.12, 0.12])
-    for obs in step_toward(env, obs, approach, gripper=1.0, max_steps=100):
+    # Phase A: Move directly above the cube center
+    print("\nPhase A: moving above cube top...")
+    above = cube_pos + np.array([0.0, 0.0, 0.20])
+    for obs in step_toward(env, obs, above, gripper=1.0, max_steps=100):
         record(obs)
 
-    # Phase B: Lower to pushing height (just above table, front face of cube)
-    print("Phase B: lowering to push height...")
-    push_start = cube_pos + np.array([0.0, -0.07, 0.0])
-    for obs in step_toward(env, obs, push_start, gripper=-1.0, max_steps=80):
+    # Phase B: Descend to contact the cube top face
+    print("Phase B: descending to touch cube top face...")
+    touch = cube_pos + np.array([0.0, 0.0, 0.02])
+    for obs in step_toward(env, obs, touch, gripper=-1.0, max_steps=120):
         record(obs)
 
-    # Brief hold to let gripper settle
-    for obs in hold(env, obs, 10, gripper=-1.0):
+    # Phase C: Push cube forward (+Y) while staying at the same height
+    print("Phase C: pushing cube forward from top...")
+    push_end = cube_pos + np.array([0.0, 0.05, 0.02])                                                                                        
+    for obs in step_toward(env, obs, push_end, gripper=-1.0, max_steps=120, tol=0.01):
         record(obs)
 
-    # Phase C: Push cube straight to the back (+Y direction)
-    print("Phase C: pushing cube from front to back...")
-    push_end = cube_pos + np.array([0.0, 0.38, 0.0])
-    for obs in step_toward(env, obs, push_end, gripper=-1.0, max_steps=200, tol=0.01):
-        record(obs)
-
-    # Phase D: Retract arm upward
+    # Phase D: Retract upward
     print("Phase D: retracting arm...")
     eef_pos = obs["robot0_eef_pos"]
     retract = eef_pos + np.array([0.0, 0.0, 0.20])
@@ -121,19 +115,21 @@ def run_episode(env):
 
     final_cube_pos = env.get_cube_pos()
     displacement = final_cube_pos[1] - cube_pos[1]
-    print(f"\nCube displaced {displacement:.3f} m in Y (front→back).")
+    print(f"\nCube displaced {displacement:.3f} m in +Y.")
     print(f"Total frames recorded: {len(thirdview_frames)}")
 
     return thirdview_frames, attention_frames
 
 
-def save_video(frames, path, fps):
-    # macro_block_size=1 preserves exact frame dimensions (avoids upscaling for small crops)
+def save_video(frames, path, fps, upscale=1):
     writer = imageio.get_writer(path, fps=fps, codec="libx264", quality=8, macro_block_size=1)
     for frame in frames:
+        if upscale > 1:
+            frame = np.repeat(np.repeat(frame, upscale, axis=0), upscale, axis=1)
         writer.append_data(frame)
     writer.close()
-    print(f"Saved {path}  ({len(frames)} frames @ {fps} fps)")
+    h, w = frames[0].shape[:2]
+    print(f"Saved {path}  ({len(frames)} frames @ {fps} fps, {w*upscale}×{h*upscale} px)")
 
 
 def main():
@@ -153,7 +149,7 @@ def main():
 
     print("\nSaving videos...")
     save_video(thirdview_frames, "thirdview.mp4", FPS)
-    save_video(attention_frames, "attention.mp4", FPS)
+    save_video(attention_frames, "attention.mp4", FPS, upscale=20)
     print("\nDone. Output files: thirdview.mp4, attention.mp4")
 
 
