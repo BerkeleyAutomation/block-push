@@ -91,12 +91,20 @@ def main():
     # Draw attention window rectangle
     x1, y1 = u0 - half, v0 - half
     x2, y2 = u0 + half, v0 + half
-    cv2.rectangle(frame_bgr, (x1, y1), (x2, y2), (0, 0, 255), 1)
-    cv2.putText(frame_bgr, "Attention Window", (x1, y1 - 6),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
+    # Commenting this out to generate clean mask images for the cube detection 
+    #cv2.rectangle(frame_bgr, (x1, y1), (x2, y2), (0, 0, 255), 1)
+    #cv2.putText(
+    #    frame_bgr,
+    #    "Attention Window",
+    #    (x1, y1 - 6),
+    #    cv2.FONT_HERSHEY_SIMPLEX,
+    #    0.4,
+    #    (0, 0, 255),
+    #    1,
+    #)
 
     cv2.imwrite("setup_check.png", frame_bgr)
-    print("\nSaved setup_check.png with attention window drawn.")
+    print("\nSaved setup_check.png.")
 
     # ------------------------------------------------------------------
     # Viser 3D viewer

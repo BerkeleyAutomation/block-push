@@ -2,7 +2,7 @@
 
 Franka Panda cube-pushing simulation using [RoboSuite](https://github.com/ARISE-Initiative/robosuite).
 
-A scripted arm pushes a green cube from front to back relative to a fixed third-view camera. Two streams are recorded:
+A scripted arm pushes a yellow cube from front to back relative to a fixed third-view camera. Two streams are recorded:
 - **thirdview.mp4** — 480×480 full camera view
 - **attention.mp4** — fixed 20×20 pixel attention window anchored at the cube-table contact area
 
@@ -14,7 +14,7 @@ The attention window concept is from the [Surgical D-Knot paper](https://arxiv.o
 Camera (front-elevated, looking toward +Y)
         |
         v
-   [Green cube]   ← arm approaches here
+   [Yellow cube]   ← arm approaches here
    ─ ─ ─ ─ ─ ─   ← attention window fixed here (cube-table contact)
    [  Table   ]
          (back of table, +Y)
@@ -22,17 +22,34 @@ Camera (front-elevated, looking toward +Y)
 
 ## Requirements
 
-- Python ≥ 3.10
+- Python 3.12+ — required for SAM3.
 - [uv](https://github.com/astral-sh/uv) (`pip install uv` or `curl -LsSf https://astral.sh/uv/install.sh | sh`)
 - A display or virtual framebuffer for MuJoCo offscreen rendering.  
   On headless servers use: `export MUJOCO_GL=egl` or `Xvfb :1 -screen 0 1024x768x24 & export DISPLAY=:1`
 
 ## Setup
 
+  # For this workstation (as dependencies already installed): 
+  ```bash 
+  source activate_bigdrive.sh
+  ```
+
 ```bash
 git clone <repo-url>
 cd block-push
+
+uv venv --python 3.12
+source .venv/bin/activate
 uv sync
+uv pip install torch==2.10.0 torchvision --index-url https://download.pytorch.org/whl/cu128
+
+#Install SAM3 locally 
+git clone https://github.com/facebookresearch/sam3.git
+echo "sam3/" >> .gitignore
+
+uv pip install -e ./sam3
+uv pip install einops pycocotools decord opencv-python matplotlib scikit-image scikit-learn
+
 ```
 
 ## Usage
@@ -61,14 +78,26 @@ Outputs:
 
 Console output shows per-phase progress and final cube displacement.
 
+### 3 . Run SAM3 inference
+```bash
+# run with HF-default behavior via: 
+uv run python sam3_setup_test.py 
+# Or use local weights when you want to: 
+uv run python sam3_setup_test.py --checkpoint /path/to/sam3.pt
+```
+
 ## Project structure
 
 ```
 block-push/
-├── pyproject.toml       # uv project + dependencies
-├── cube_push_env.py     # FrankaCubePushEnv (ManipulationEnv subclass)
-├── visualize_setup.py   # Viser-based setup verification
-├── run_push.py          # Scripted push + video recording
+├── pyproject.toml          # uv project dependencies
+├── uv.lock                 # uv lockfile
+├── cube_push_env.py        # FrankaCubePushEnv
+├── visualize_setup.py      # Scene/camera/attention-window visualization
+├── run_push.py             # Scripted push + video recording
+├── sam3_setup_test.py      # SAM3 segmentation test on setup_check.png
+├── sam3/                   # Local SAM3 clone, gitignored
+├── activate_bigdrive.sh    # Optional workstation cache/env activation
 └── README.md
 ```
 
