@@ -1,0 +1,36 @@
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+.venv/
+venv/
+
+# Build / packaging artifacts
+build/
+dist/
+*.egg-info/
+
+# Test / tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local environment files
+.env
+.env.*
+uv.lock
+
+# Generated media artifacts from this project
+results/
+thirdview.mp4
+attention.mp4
+setup_check.png
+
+# IDE / OS noise
+.DS_Store
+.idea/
+.vscode/
+sam3/
+activate_bigdrive.sh
