@@ -242,6 +242,29 @@ class FrankaCubePushEnv(ManipulationEnv):
         cam_R = Rotation.from_quat(q_xyzw).as_matrix()
         return cam_pos, cam_R
 
+    def get_focal_length(self, fovy=CAMERA_FOVY):
+        """Focal length in pixels for the thirdview camera."""
+        return (self.camera_height / 2.0) / np.tan(np.deg2rad(fovy) / 2.0)
+
+    def get_camera_params(self):
+        """Return (cam_pos, cam_R, f, W, H) for the thirdview camera.
+
+        Convenience bundle for servoing math; avoids multiple calls.
+        """
+        cam_pos, cam_R = self.get_camera_extrinsics()
+        f = self.get_focal_length()
+        return cam_pos, cam_R, f, self.camera_width, self.camera_height
+
+    def get_attn_camera_params(self):
+        """Return (cam_pos, cam_R, f, W, H) for the attention camera."""
+        cam_id = self.sim.model.camera_name2id(ATTN_CAM_NAME)
+        cam_pos = self.sim.model.cam_pos[cam_id].copy()
+        wxyz = self.sim.model.cam_quat[cam_id].copy()
+        q_xyzw = np.array([wxyz[1], wxyz[2], wxyz[3], wxyz[0]])
+        cam_R = Rotation.from_quat(q_xyzw).as_matrix()
+        f = (self.camera_height / 2.0) / np.tan(np.deg2rad(ATTN_CAM_FOVY) / 2.0)
+        return cam_pos, cam_R, f, self.camera_width, self.camera_height
+
     def world_to_pixel(self, point_3d, fovy=CAMERA_FOVY):
         """
         Project a 3D world point to (u, v) pixel coordinates in the thirdview camera.
@@ -254,9 +277,10 @@ class FrankaCubePushEnv(ManipulationEnv):
         p_cam = cam_R.T @ (point_3d - cam_pos)
 
         f = (H / 2.0) / np.tan(np.deg2rad(fovy) / 2.0)
-        # Standard OpenGL pinhole projection
+        # Standard OpenGL pinhole projection.  Camera looks in -Z, +Y is up.
+        # OpenGL: u_gl = W/2 + X*f/(-Z); v_gl = H/2 + Y*f/(-Z).
         u_gl = -f * p_cam[0] / p_cam[2] + W / 2.0
-        v_gl =  f * p_cam[1] / p_cam[2] + H / 2.0
+        v_gl = -f * p_cam[1] / p_cam[2] + H / 2.0
         u = int(round(u_gl))
         # OpenGL origin is bottom-left; get_frame flips vertically to screen-top-left,
         # so we must mirror v to match the flipped frame.
@@ -274,7 +298,7 @@ class FrankaCubePushEnv(ManipulationEnv):
         p_cam = cam_R.T @ (point_3d - cam_pos)
         f = (H / 2.0) / np.tan(np.deg2rad(ATTN_CAM_FOVY) / 2.0)
         u_gl = -f * p_cam[0] / p_cam[2] + W / 2.0
-        v_gl =  f * p_cam[1] / p_cam[2] + H / 2.0
+        v_gl = -f * p_cam[1] / p_cam[2] + H / 2.0
         u = int(round(u_gl))
         v = int(round(H - 1 - v_gl))
         return u, v
