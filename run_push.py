@@ -1,23 +1,36 @@
 """
-run_push.py — SAM3 + visual servoing cube push (no 3D cube coords).
+run_push.py — SAM3 + image-space visual servoing cube push (no cube depth).
+
+Single-camera pipeline.  The 20×20 attention window is cropped from the
+thirdview frame at the cube-table interface; gripper image is locked to
+the cube pixel by Phase-2 ray-following so the gripper stays above the
+window.
 
 Pipeline per episode:
-  1. Reset env, capture first frame from thirdview + attention cameras
-  2. SAM3 on attention frame → cube mask + centroid pixel
-  3. Unproject centroid pixel to a 3D world point on the cube-center Z plane
-  4. Phase A : move EEF to APPROACH_HEIGHT above the cube
-  5. Phase B1: align EEF world XY with the cube world XY at current Z
-  6. Phase B2: descend Z (action saturated) until stall- or flow-based contact
-  7. Phase C : push +Y to displace the cube
-  8. Phase D : retract straight up
+  1. Reset env, capture first thirdview frame
+  2. SAM3 on thirdview frame → cube mask + centroid + bottom-edge anchor
+  3. Phase A : move EEF to APPROACH_HEIGHT above the table at current EEF XY
+  4. Phase B1: image-space XY alignment — at each step solve for the world XY
+               (at the EEF's CURRENT Z) that projects to the cube's pixel;
+               step toward it until the EEF pixel is within STOP_PIXEL_THRESHOLD
+  5. Phase B2: descend along the thirdview camera ray (keeps cube pixel
+               locked) until the cube's yellow pixels in the 20×20 window
+               crop drop below YELLOW_DROP_FRACTION of their initial count
+               — i.e. the cube has translated up and out of the window.
+               On the trigger, re-run SAM3 on the current thirdview frame
+               and report the cube's 3D position from sim ground truth.
+
+The cube's 3D height is never used for control — only the EEF's own
+(kinematically known) depth and the camera intrinsics + extrinsics.  The
+final 3D coords printed on contact are simulator ground truth, for
+verification only.
 
 Outputs (per invocation, written to results/run_<N>/):
   thirdview.mp4         — third-view recording with SAM3/EEF overlays
-  attention.mp4         — crop of the attention-camera view (gripper-free)
+  attention.mp4         — 20×20 thirdview crop of the attention window,
+                          upscaled 12×
   debug_first_frame.png — raw thirdview at start of episode
-  debug_attn_frame.png  — raw attention frame at start of episode
-  debug_sam3_attn.png   — SAM3 mask drawn over attention frame
-  debug_sam3.png        — projected cube keypoints on thirdview
+  debug_sam3.png        — SAM3 mask + 20×20 attention window on thirdview
 
 Usage:
     uv run python run_push.py [--checkpoint /path/to/sam3.pt]
@@ -30,9 +43,9 @@ import numpy as np
 import imageio
 import cv2
 
-from cube_push_env import FrankaCubePushEnv, TABLE_SURFACE_Z, CUBE_HALF
+from cube_push_env import FrankaCubePushEnv, TABLE_SURFACE_Z
 from segmentation import load_sam3_model, segment_cube_sam3
-from servoing import pixel_error_to_robot_delta, pixel_to_world_at_z
+from servoing import pixel_to_world_at_z
 
 RESULTS_ROOT = Path(__file__).resolve().parent / "results"
 
@@ -40,84 +53,49 @@ RESULTS_ROOT = Path(__file__).resolve().parent / "results"
 # Recording / window constants
 # ---------------------------------------------------------------------------
 FPS = 20
-ATTENTION_HALF = 10   # 20×20 thirdview overlay rectangle (visualization only)
-ATTN_RECORD_HALF = 60 # half-size of crop on the attention camera (gripper-free view)
-ATTN_UPSCALE = 4      # upscale factor for the saved attention video
-DETECT_HALF = 40      # 80×80 crop used for contact detection
+ATTENTION_HALF = 6   # 20×20 thirdview overlay rectangle (visualization)
+DETECT_HALF = 6      # 20×20 crop used for contact detection
+# SAM3's mask on thirdview underestimates the cube (only catches the top
+# face), so its bottom_y sits on the cube body rather than the actual
+# cube-table line.  Push the anchor down by this many pixels so the
+# 20×20 window straddles the real cube-bottom edge in image space — the
+# upper half of the window contains cube body, the lower half contains
+# the table strip just below the cube.  When the cube is pushed in +Y
+# (away from camera), the cube image translates UP and exits the window
+# from the top, leaving pure table content behind.
+WINDOW_DROP_PX = 22
 
 # ---------------------------------------------------------------------------
-# Servoing parameters
+# Servoing parameters — purely image-space alignment + camera-ray descent.
+# Cube depth is NEVER assumed.
 # ---------------------------------------------------------------------------
-APPROACH_HEIGHT = 0.20       # m above cube top (Phase A target Z)
-SERVO_KP = 1.0               # proportional XY gain; reduce if oscillating
-STOP_PIXEL_THRESHOLD = 20    # px: Phase B1 done when |error| < this
-DESCENT_ACTION_MAX = 0.15    # max |action[2]| in Phase B2 (≈7.5 mm/step OSC delta)
-DESCENT_DEEP_Z = TABLE_SURFACE_Z - 0.10   # well below the table, drives action saturation
-STALL_WINDOW = 15            # iterations to look back for stall detection
-STALL_DZ_THRESH = 0.0008     # m: <0.8 mm drop in window → contact stall
-CUBE_CENTER_Z = TABLE_SURFACE_Z + CUBE_HALF        # mass-centroid Z of the cube
-CUBE_TOP_Z    = TABLE_SURFACE_Z + 2 * CUBE_HALF    # top face of the cube
-
-
-# ---------------------------------------------------------------------------
-# Contact detection  (unchanged)
-# ---------------------------------------------------------------------------
-
-def cube_contact_detection(prev_frames, current_gray, state,
-                           threshold=15,
-                           threshold_area=30,
-                           stability_threshold=2,
-                           flow_threshold=2.0):
-    """
-    Detect whether the cube has moved inside the attention window.
-    Uses frame-difference + Farneback optical flow.
-    """
-    if len(prev_frames) < 3:
-        return False, cv2.cvtColor(current_gray, cv2.COLOR_GRAY2BGR)
-
-    prev_gray = np.median(np.array(prev_frames), axis=0).astype(np.uint8)
-
-    delta = cv2.absdiff(prev_gray, current_gray)
-    delta_blur = cv2.GaussianBlur(delta, (5, 5), 0)
-    _, thresh = cv2.threshold(delta_blur, threshold, 255, cv2.THRESH_BINARY)
-
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=1)
-
-    contours, _ = cv2.findContours(thresh.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    large_contours = [c for c in contours if cv2.contourArea(c) > threshold_area]
-
-    flow = cv2.calcOpticalFlowFarneback(
-        prev_gray, current_gray, None, 0.5, 3, 15, 3, 5, 1.2, 0)
-    mag, _ = cv2.cartToPolar(flow[..., 0], flow[..., 1])
-    mag[mag < flow_threshold] = 0
-
-    moving_pixels = np.sum(mag > flow_threshold)
-    ratio = moving_pixels / (mag.size + 1e-5)
-    mean_mag = np.mean(mag)
-    max_mag = np.max(mag)
-
-    print(f"[Contact] ratio={ratio:.3f}  mean_mag={mean_mag:.3f}  max_mag={max_mag:.3f}")
-
-    motion_detected = bool(large_contours and ratio > 0.15 and mean_mag > 0.4)
-
-    if motion_detected:
-        state['contact_frame_count'] += 1
-        contact_detected = state['contact_frame_count'] >= stability_threshold
-        if contact_detected:
-            state['contact_frame_count'] = 0
-    else:
-        state['contact_frame_count'] = 0
-        contact_detected = False
-
-    mag_norm = cv2.normalize(mag, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-    img_vis = np.hstack([
-        cv2.cvtColor(prev_gray, cv2.COLOR_GRAY2BGR),
-        cv2.cvtColor(current_gray, cv2.COLOR_GRAY2BGR),
-        cv2.cvtColor(thresh, cv2.COLOR_GRAY2BGR),
-        cv2.applyColorMap(mag_norm, cv2.COLORMAP_JET),
-    ])
-    return contact_detected, img_vis
+APPROACH_HEIGHT = 0.20       # m above table surface (Phase A target Z)
+STOP_PIXEL_THRESHOLD = 20    # px: Phase B1 done when |EEF px - cube px| < this
+SERVO_DZ = 0.008             # camera-frame depth step per Phase-2 iteration (m).
+                             # World-Z descent is ~SERVO_DZ * cos(camera_tilt),
+                             # and the OSC controller tracks at ~15% of command,
+                             # so 0.008 → ~0.5 mm actual world-Z descent per step.
+PHASE1_MAX_STEPS = 120
+PHASE2_MAX_STEPS = 600
+PHASE2_WARMUP_STEPS = 20     # skip checks only for early alignment transients;
+                             # do not block stopping for most of the descent
+ATTN_VIDEO_UPSCALE = 12      # upscale 20×20 attn crop → 240×240 in the saved video
+# Detection: count near-white (table) pixels in the attention-window crop.
+# The cube fills the upper portion of the window initially (cube body =
+# coloured, not white), so initial white count is low.  When the gripper
+# pushes the cube +Y (away from camera, up in image), the cube exits the
+# window from above and only table remains — white count rises sharply.
+# Trigger fires once the window is dominantly white.
+WHITE_RGB_THRESH = 200           # per-channel: R, G, AND B must each exceed
+                                 # this to be "white" (rejects cube body and
+                                 # gripper, both of which fail the B channel)
+WHITE_TRIGGER_FRACTION = 0.60    # trigger when white fraction of window
+                                 # pixels exceeds this (cube is gone, table
+                                 # fills the window)
+WHITE_MIN_RISE = 20              # absolute minimum rise in white count from
+                                 # initial — guards against false fires when
+                                 # the initial frame already happened to have
+                                 # mostly table (cube barely in window)
 
 
 # ---------------------------------------------------------------------------
@@ -220,201 +198,241 @@ def run_episode(env, processor, out_dir):
         pass
 
     first_frame = env.get_frame(obs)
-    attn_frame = env.get_attention_frame(obs)
 
-    # Save raw frames so you can inspect what SAM3 sees
-    cv2.imwrite(str(out_dir / "debug_first_frame.png"), cv2.cvtColor(first_frame, cv2.COLOR_RGB2BGR))
-    cv2.imwrite(str(out_dir / "debug_attn_frame.png"),  cv2.cvtColor(attn_frame,  cv2.COLOR_RGB2BGR))
-    print(f"Saved debug_first_frame.png and debug_attn_frame.png in {out_dir}")
+    # Save raw frame so you can inspect what SAM3 sees
+    cv2.imwrite(str(out_dir / "debug_first_frame.png"),
+                cv2.cvtColor(first_frame, cv2.COLOR_RGB2BGR))
+    print(f"Saved debug_first_frame.png in {out_dir}")
 
     # ------------------------------------------------------------------
-    # Step 1: SAM3 detection on attention frame (cube-only view, no arm)
+    # SAM3 detection on the (only) thirdview frame.  Returns the cube
+    # mask centroid (used for Phase-1 image-space servoing) and the
+    # mask's bottom-edge midpoint, which we shift down by WINDOW_DROP_PX
+    # to anchor the 20×20 attention window at the real cube-table line.
     # ------------------------------------------------------------------
-    print("\n--- SAM3 detection (attention camera) ---")
-    sam3_mask, attn_centroid_px, _ = segment_cube_sam3(attn_frame, processor)
-    save_sam3_debug(attn_frame, sam3_mask, attn_centroid_px, None,
-                    str(out_dir / "debug_sam3_attn.png"))
-    print("Saved debug_sam3_attn.png — open this to verify the cube was detected correctly")
-
-    # Unproject attention centroid to 3D world point at the cube CENTER plane
-    # (SAM3's mass-centroid sits roughly at the cube's vertical center, not its top).
-    attn_cam_pos, attn_cam_R, attn_f, W, H = env.get_attn_camera_params()
-    cube_3d = pixel_to_world_at_z(
-        attn_centroid_px[0], attn_centroid_px[1],
-        CUBE_CENTER_Z,
-        attn_cam_pos, attn_cam_R, attn_f, W, H,
+    print("\n--- SAM3 detection (thirdview camera) ---")
+    # The cube is small (~25 px) in the full thirdview frame — too small for
+    # SAM3 to reliably detect.  Crop a generous image-space window over the
+    # table region and upscale before running SAM3.  Center is a fixed
+    # image-space prior (lower-center of the frame, where the table sits in
+    # this fixed-camera setup); no cube 3D pose is used.
+    H_img, W_img = first_frame.shape[:2]
+    crop_center_px = (W_img // 2, int(H_img * 0.6))
+    print(f"  SAM3 crop_center={crop_center_px}  half=120  upscale=4")
+    sam3_mask, centroid_px, sam3_bottom_px = segment_cube_sam3(
+        first_frame, processor,
+        crop_center=crop_center_px, crop_half=120, upscale=4,
     )
-    print(f"  cube_3d from attn SAM3: {cube_3d.round(3)}")
+    # Anchor the window at the cube-table line: SAM3 mask bottom (top-face
+    # bottom edge in image) + WINDOW_DROP_PX to reach the actual cube body
+    # bottom + a strip of table.  Cube is in the upper half of the window
+    # initially; when the gripper pushes the cube +Y (away from camera, up
+    # in image), the cube exits the window from above and only table
+    # remains.
+    attn_anchor_px = (sam3_bottom_px[0], sam3_bottom_px[1] + WINDOW_DROP_PX)
+    print(f"  centroid_px={centroid_px}  sam3_bottom_px={sam3_bottom_px}  "
+          f"attn_window_px={attn_anchor_px}")
 
-    # === DIAGNOSTIC: compare reprojected cube_3d to the simulator's ground truth ===
-    # NOT used for navigation — only to verify the SAM3 → unproject pipeline.
+    # === DIAGNOSTIC: compare SAM3 detection to ground-truth pixel projection ===
     actual_cube = env.get_cube_pos()
-    actual_attn_px  = env.attn_world_to_pixel(actual_cube)
     actual_third_px = env.world_to_pixel(actual_cube)
-    print(f"  [diag] actual cube 3D       : {actual_cube.round(3)}")
-    print(f"  [diag] actual cube attn px  : {actual_attn_px}    (SAM3 said {attn_centroid_px})")
-    print(f"  [diag] actual cube third px : {actual_third_px}")
-    print(f"  [diag] cube_3d - actual XY  : "
-          f"({cube_3d[0]-actual_cube[0]:+.3f}, {cube_3d[1]-actual_cube[1]:+.3f})")
+    print(f"  [diag] actual cube 3D : {actual_cube.round(3)}")
+    print(f"  [diag] actual cube px : {actual_third_px}    (SAM3 said {centroid_px})")
+    print(f"  [diag] pixel error    : "
+          f"({centroid_px[0]-actual_third_px[0]:+d}, {centroid_px[1]-actual_third_px[1]:+d})")
 
-    # Project cube_3d to thirdview for overlay and contact detection crop
-    cam_pos, cam_R, f, W, H = env.get_camera_params()
-    centroid_px = env.world_to_pixel(cube_3d)
-    attn_anchor_px = env.world_to_pixel(
-        np.array([cube_3d[0], cube_3d[1], TABLE_SURFACE_Z])
-    )
-    print(f"  centroid_px (thirdview)={centroid_px}  attn_anchor_px={attn_anchor_px}")
-
-    # Save thirdview debug with projected keypoints
-    save_sam3_debug(first_frame, None, centroid_px, attn_anchor_px,
+    save_sam3_debug(first_frame, sam3_mask, centroid_px, attn_anchor_px,
                     str(out_dir / "debug_sam3.png"))
-    print("Saved debug_sam3.png — shows projected cube position on thirdview")
+    print("Saved debug_sam3.png — verify the 20×20 attention window sits on "
+          "the cube-bottom + table strip in the thirdview frame")
+
+    # Thirdview camera params (used by Phases B1 + B2)
+    cam_pos, cam_R, f, W, H = env.get_camera_params()
+
+    # 20×20 detection-crop bounds in the THIRDVIEW frame.
+    awx, awy = attn_anchor_px
+    adx1 = max(awx - DETECT_HALF, 0)
+    ady1 = max(awy - DETECT_HALF, 0)
+    adx2 = min(awx + DETECT_HALF, W)
+    ady2 = min(awy + DETECT_HALF, H)
 
     # ------------------------------------------------------------------
-    # Recording helpers
+    # Recording helpers — attention.mp4 shows ONLY the 20×20 thirdview
+    # crop at the attention window (upscaled), so the user sees exactly
+    # what the contact algorithm sees.  Thirdview overlay still draws
+    # the full scene.
     # ------------------------------------------------------------------
     thirdview_frames = []
-    attention_frames = []
-    ax, ay = attn_anchor_px
-    cax, cay = attn_centroid_px  # cube pixel in the attention camera (gripper-free)
+    attention_frames = []  # each frame is the 20×20 crop, upscaled at save
 
     def record(obs, eef_px=None):
         frame = env.get_frame(obs)
         vis = draw_debug_overlay(frame, sam3_mask, centroid_px, attn_anchor_px, eef_px)
         thirdview_frames.append(vis)
 
-        attn_full = env.get_attention_frame(obs)
-        aH, aW = attn_full.shape[:2]
-        r0 = max(0, cay - ATTN_RECORD_HALF)
-        r1 = min(aH, cay + ATTN_RECORD_HALF)
-        c0 = max(0, cax - ATTN_RECORD_HALF)
-        c1 = min(aW, cax + ATTN_RECORD_HALF)
-        crop = attn_full[r0:r1, c0:c1]
-        ph = (2 * ATTN_RECORD_HALF) - crop.shape[0]
-        pw = (2 * ATTN_RECORD_HALF) - crop.shape[1]
+        crop = frame[ady1:ady2, adx1:adx2]
+        # Pad to consistent 20×20 if window clipped at frame edge
+        ph = (2 * DETECT_HALF) - crop.shape[0]
+        pw = (2 * DETECT_HALF) - crop.shape[1]
         if ph > 0 or pw > 0:
             crop = np.pad(crop, ((0, ph), (0, pw), (0, 0)))
         attention_frames.append(crop)
         return frame
 
-    # Record first frame (SAM3 ran on this)
     record(obs)
 
-    # Detection crop bounds (used for contact detection in Phase B2)
-    dx1 = max(ax - DETECT_HALF, 0)
-    dy1 = max(ay - DETECT_HALF, 0)
-    dx2 = min(ax + DETECT_HALF, W)
-    dy2 = min(ay + DETECT_HALF, H)
-
     # ------------------------------------------------------------------
-    # Phase A: move above cube (cube_3d XY, approach height Z)
+    # Phase A: move EEF straight up to APPROACH_HEIGHT above the table.
+    # No cube coords used — we just lift to a known-safe height before servoing.
     # ------------------------------------------------------------------
-    print("\n--- Phase A: move above cube ---")
-    above_3d = np.array([cube_3d[0], cube_3d[1], CUBE_TOP_Z + APPROACH_HEIGHT])
-    print(f"  cube_3d={cube_3d.round(3)}  above_3d={above_3d.round(3)}")
+    print("\n--- Phase A: lift to approach height ---")
+    eef_now = obs["robot0_eef_pos"]
+    above_3d = np.array([eef_now[0], eef_now[1], TABLE_SURFACE_Z + APPROACH_HEIGHT])
+    print(f"  current EEF={eef_now.round(3)}  above_target={above_3d.round(3)}")
     for obs in step_toward(env, obs, above_3d, gripper=1.0, max_steps=100):
         eef_px = env.world_to_pixel(obs["robot0_eef_pos"])
         record(obs, eef_px)
 
     # ------------------------------------------------------------------
-    # Phase B1: XY alignment — move EEF to cube XY at current Z
+    # Phase B1: image-space XY alignment (no cube depth).
+    #
+    # At each step, solve for the world XY at the EEF's CURRENT Z that
+    # projects to the cube's pixel — that's the world point through the
+    # camera ray at the gripper's known depth — and step toward it.
     # ------------------------------------------------------------------
-    print("\n--- Phase B1: XY alignment ---")
-    print(f"  cube world XY: ({cube_3d[0]:.3f}, {cube_3d[1]:.3f})")
-    eef_z = obs["robot0_eef_pos"][2]
-    b1_target = np.array([cube_3d[0], cube_3d[1], eef_z])
-    for obs in step_toward(env, obs, b1_target, gripper=-1.0, max_steps=80, tol=0.003):
+    print("\n--- Phase B1: image-space XY alignment ---")
+    for step_i in range(PHASE1_MAX_STEPS):
+        eef_pos = obs["robot0_eef_pos"]
+        eef_z = float(eef_pos[2])
+        target_world = pixel_to_world_at_z(
+            centroid_px[0], centroid_px[1], eef_z,
+            cam_pos, cam_R, f, W, H,
+        )
+        target_world[2] = eef_z  # alignment is pure XY — preserve Z
+        err = target_world - eef_pos
+        action = np.zeros(7)
+        action[:3] = np.clip(err / 0.05, -1.0, 1.0)
+        action[6] = -1.0
+        obs, _, _, _ = env.step(action)
         eef_px = env.world_to_pixel(obs["robot0_eef_pos"])
-        print(f"  EEF px={eef_px}  target_cube_px={centroid_px}")
         record(obs, eef_px)
 
-    # ------------------------------------------------------------------
-    # Phase B2: Z descent along cube XY column until contact.
-    #
-    # Strategy: target a deep Z below the table so action[2] saturates and the
-    # OSC drives a steady descent.  Detect contact via Z stall (EEF stops
-    # dropping despite commanding descent) — robust regardless of camera noise.
-    # Also keep optical-flow detector as a secondary signal.
-    # ------------------------------------------------------------------
-    print("\n--- Phase B2: Z approach to cube ---")
-    prev_detect_frames = []
-    contact_state = {'contact_frame_count': 0}
-    contact_confirmed = False
-    z_history = []
-    start_z = obs["robot0_eef_pos"][2]
-    print(f"  start EEF z={start_z:.4f}, target deep z={DESCENT_DEEP_Z:.4f}")
+        pix_err = float(np.hypot(eef_px[0] - centroid_px[0],
+                                 eef_px[1] - centroid_px[1]))
+        if step_i % 5 == 0:
+            print(f"  step={step_i:3d}  EEF px={eef_px}  cube px={centroid_px}  "
+                  f"pix_err={pix_err:.1f}")
+        if pix_err < STOP_PIXEL_THRESHOLD:
+            print(f"====== ALIGNED at step {step_i}  pix_err={pix_err:.1f} ======")
+            break
+    else:
+        print(f"[Phase B1] Max iterations reached.  pix_err={pix_err:.1f}")
 
-    for step_i in range(500):
+    # ------------------------------------------------------------------
+    # Phase B2: descend along the thirdview camera ray through the cube
+    # pixel.  The cube pixel stays locked in the image while the EEF moves
+    # toward it; stop when the 20×20 attention window detects motion via
+    # image differencing + Farneback optical flow.
+    # ------------------------------------------------------------------
+    print("\n--- Phase B2: camera-ray descent ---")
+    # Ray direction in camera frame for the cube pixel.  Same convention as
+    # pixel_to_world_at_z: p_cam[0] = ax_ray*z, p_cam[1] = ay_ray*z, p_cam[2] = z.
+    u_cube, v_cube = centroid_px
+    v_gl = H - 1 - v_cube
+    ax_ray = -(u_cube - W / 2.0) / f
+    ay_ray = -(v_gl - H / 2.0) / f
+
+    contact_confirmed = False
+    start_z = obs["robot0_eef_pos"][2]
+    print(f"  start EEF z={start_z:.4f}, ray=({ax_ray:+.3f}, {ay_ray:+.3f})")
+
+    window_total_px = (ady2 - ady1) * (adx2 - adx1)
+
+    def white_count(rgb_crop):
+        """Count near-white (table) pixels: R, G, AND B all above
+        WHITE_RGB_THRESH.  Cube body fails the B channel (cube b is much
+        lower than r,g); gripper is gray (~128) and fails the per-channel
+        threshold; cube shadow on table darkens R/G/B uniformly so it also
+        fails."""
+        return int(np.sum(np.all(rgb_crop > WHITE_RGB_THRESH, axis=-1)))
+
+    # Capture initial white_count from the CURRENT frame at the start of
+    # Phase B2 (after Phase A/B1). This keeps the baseline aligned with the
+    # active attention-window content instead of using reset-time frame 0.
+    phase2_start_frame = env.get_frame(obs)
+    initial_crop = phase2_start_frame[ady1:ady2, adx1:adx2]
+    initial_white_count = white_count(initial_crop)
+    print(f"  initial white_count (Phase B2 start) = {initial_white_count} / "
+          f"{window_total_px} px")
+
+    for step_i in range(PHASE2_MAX_STEPS):
         eef_pos = obs["robot0_eef_pos"]
-        target_3d = np.array([cube_3d[0], cube_3d[1], DESCENT_DEEP_Z])
-        raw = (target_3d - eef_pos) / 0.05
+        # Current EEF camera-frame depth (negative; camera looks along -cam_Z).
+        p_cam_eef = cam_R.T @ (eef_pos - cam_pos)
+        # Step "deeper" along the ray: p_cam[2] becomes more negative.
+        z_cam_target = float(p_cam_eef[2]) - SERVO_DZ
+        target_cam = np.array([ax_ray * z_cam_target,
+                               ay_ray * z_cam_target,
+                               z_cam_target])
+        target_world = cam_pos + cam_R @ target_cam
+        err = target_world - eef_pos
         action = np.zeros(7)
-        action[0] = float(np.clip(raw[0], -1.0, 1.0))
-        action[1] = float(np.clip(raw[1], -1.0, 1.0))
-        action[2] = float(np.clip(raw[2], -DESCENT_ACTION_MAX, DESCENT_ACTION_MAX))
+        action[:3] = np.clip(err / 0.05, -1.0, 1.0)
         action[6] = -1.0
         obs, _, _, _ = env.step(action)
         frame = record(obs, env.world_to_pixel(obs["robot0_eef_pos"]))
 
-        z_now = obs["robot0_eef_pos"][2]
-        z_history.append(z_now)
-        if len(z_history) > STALL_WINDOW:
-            z_history.pop(0)
+        # 20×20 thirdview crop at the attention window
+        crop_rgb = frame[ady1:ady2, adx1:adx2]
 
-        if step_i % 10 == 0:
-            print(f"  step={step_i:3d}  EEF z={z_now:.4f}")
+        if step_i % 25 == 0:
+            ep = obs['robot0_eef_pos']
+            eef_px_now = env.world_to_pixel(ep)
+            print(f"  step={step_i:3d}  EEF=({ep[0]:+.3f},{ep[1]:+.3f},{ep[2]:.3f})  "
+                  f"EEF px={eef_px_now}  cube px={centroid_px}")
 
-        # Z-stall contact: EEF can't drop further despite commanding descent
-        if len(z_history) >= STALL_WINDOW:
-            dz_window = z_history[0] - z_history[-1]
-            if dz_window < STALL_DZ_THRESH and z_now < start_z - 0.05:
-                print(f"====== STALL CONTACT at step {step_i}  "
-                      f"EEF z={z_now:.4f}  dz over {STALL_WINDOW}={dz_window:.5f} ======")
-                contact_confirmed = True
-                break
-
-        # Optical-flow contact (secondary)
-        crop_gray = cv2.cvtColor(
-            cv2.cvtColor(frame[dy1:dy2, dx1:dx2], cv2.COLOR_RGB2BGR),
-            cv2.COLOR_BGR2GRAY,
-        )
-        prev_detect_frames.append(crop_gray)
-        if len(prev_detect_frames) > 5:
-            prev_detect_frames.pop(0)
-
-        if len(prev_detect_frames) >= 4:
-            flow_contact, _ = cube_contact_detection(
-                prev_detect_frames[:-1], crop_gray, contact_state)
-            if flow_contact:
-                print(f"====== FLOW CONTACT at step {step_i}  EEF z={z_now:.4f} ======")
+        if step_i >= PHASE2_WARMUP_STEPS:
+            wc = white_count(crop_rgb)
+            frac = wc / max(window_total_px, 1)
+            rise = wc - initial_white_count
+            if step_i % 25 == 0:
+                print(f"  white_count={wc:3d}/{window_total_px}  "
+                      f"frac={frac:.2f}  rise={rise:+d}  "
+                      f"(trigger when frac>{WHITE_TRIGGER_FRACTION} and "
+                      f"rise>{WHITE_MIN_RISE})")
+            if frac > WHITE_TRIGGER_FRACTION and rise > WHITE_MIN_RISE:
+                print(f"\n--- Cube exited attention window at step {step_i}, "
+                      f"EEF z={obs['robot0_eef_pos'][2]:.4f} ---")
+                print(f"  white_count: {initial_white_count} → {wc}  "
+                      f"(frac {frac:.2f}, rise {rise:+d})")
+                # SAM3 re-segmentation on the current thirdview frame, so
+                # we can show the user that the cube's mask centroid has
+                # shifted from its original position (the "compare SAM3
+                # segmentations from different frames" check).
+                print("Running SAM3 on current thirdview frame for comparison…")
+                _, verify_centroid_px, _ = segment_cube_sam3(frame, processor)
+                shift = float(np.hypot(
+                    verify_centroid_px[0] - centroid_px[0],
+                    verify_centroid_px[1] - centroid_px[1],
+                ))
+                print(f"  original SAM3 centroid: {centroid_px}")
+                print(f"  current  SAM3 centroid: {verify_centroid_px}")
+                print(f"  pixel shift           : {shift:.1f} px")
+                print("====== CUBE MOVEMENT CONFIRMED ======")
+                cube_now = env.get_cube_pos()
+                print(f"\nCube 3D position (simulator ground truth):")
+                print(f"  x = {cube_now[0]:+.4f} m")
+                print(f"  y = {cube_now[1]:+.4f} m")
+                print(f"  z = {cube_now[2]:+.4f} m")
+                print(f"  delta from start: {(cube_now - actual_cube).round(4)}")
                 contact_confirmed = True
                 break
 
     if not contact_confirmed:
-        print(f"[Phase B2] Max iterations reached. Final EEF z={obs['robot0_eef_pos'][2]:.4f}")
-
-    # ------------------------------------------------------------------
-    # Phase C: push +Y from current EEF position
-    # ------------------------------------------------------------------
-    print("\n--- Phase C: push cube ---")
-    cube_before = env.get_cube_pos()
-    eef_pos = obs["robot0_eef_pos"]
-    push_target = eef_pos + np.array([0.0, 0.05, 0.0])
-    for obs in step_toward(env, obs, push_target, gripper=-1.0, max_steps=120, tol=0.01):
-        record(obs)
-    cube_after = env.get_cube_pos()
-    print(f"  cube before push: {cube_before.round(3)}")
-    print(f"  cube after  push: {cube_after.round(3)}")
-    print(f"  cube delta XYZ  : {(cube_after - cube_before).round(3)}")
-
-    # ------------------------------------------------------------------
-    # Phase D: retract
-    # ------------------------------------------------------------------
-    print("\n--- Phase D: retract ---")
-    eef_pos = obs["robot0_eef_pos"]
-    retract = eef_pos + np.array([0.0, 0.0, 0.20])
-    for obs in step_toward(env, obs, retract, gripper=1.0, max_steps=60):
-        record(obs)
+        print(f"[Phase B2] Max iterations reached.  EEF z={obs['robot0_eef_pos'][2]:.4f}")
+        cube_now = env.get_cube_pos()
+        print(f"  cube position at end : {cube_now.round(4)}")
+        print(f"  cube delta from start: {(cube_now - actual_cube).round(4)}")
 
     print(f"\nTotal frames: {len(thirdview_frames)}")
     return thirdview_frames, attention_frames
@@ -481,7 +499,8 @@ def main():
 
     print("\nSaving videos...")
     save_video(thirdview_frames, str(out_dir / "thirdview.mp4"), FPS)
-    save_video(attention_frames, str(out_dir / "attention.mp4"), FPS, upscale=ATTN_UPSCALE)
+    save_video(attention_frames, str(out_dir / "attention.mp4"), FPS,
+               upscale=ATTN_VIDEO_UPSCALE)
     print(f"\nDone. All outputs in {out_dir}/")
 
 

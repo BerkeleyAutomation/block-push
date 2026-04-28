@@ -30,14 +30,6 @@ CUBE_HALF = 0.025
 # Green cube placed in front of table center (toward camera, -Y)
 CUBE_POS = np.array([0.0, -0.10, TABLE_SURFACE_Z + CUBE_HALF])
 
-# Attention camera — behind the cube on the +Y side so the gripper (approaching
-# from -Y) never occludes it.  Aimed at the cube-table contact point.
-ATTN_CAM_NAME   = "attn_cam"
-ATTN_CAM_POS    = np.array([0.0,  0.40,  0.90])
-ATTN_CAM_TARGET = np.array([0.0, -0.10,  0.80])  # cube-table contact (TABLE_SURFACE_Z=0.80)
-ATTN_CAM_FOVY   = 20.0
-
-
 def _look_at_quat_wxyz(pos, target):
     """Compute camera quaternion (wxyz, MuJoCo convention) for a look-at transform."""
     forward = target - pos
@@ -109,9 +101,9 @@ class FrankaCubePushEnv(ManipulationEnv):
             use_camera_obs=use_camera_obs,
             has_renderer=has_renderer,
             has_offscreen_renderer=has_offscreen_renderer,
-            camera_names=[CAMERA_NAME, ATTN_CAM_NAME],
-            camera_heights=[camera_height, camera_height],
-            camera_widths=[camera_width, camera_width],
+            camera_names=[CAMERA_NAME],
+            camera_heights=[camera_height],
+            camera_widths=[camera_width],
             camera_depths=False,
             **kwargs,
         )
@@ -146,18 +138,6 @@ class FrankaCubePushEnv(ManipulationEnv):
             "fovy": str(CAMERA_FOVY),
         })
         arena.worldbody.append(camera_elem)
-
-        # Attention camera — fixed behind the cube (+Y side); gripper never obstructs it
-        attn_quat_wxyz = _look_at_quat_wxyz(ATTN_CAM_POS, ATTN_CAM_TARGET)
-        attn_pos_str  = " ".join(f"{v:.4f}" for v in ATTN_CAM_POS)
-        attn_quat_str = " ".join(f"{v:.6f}" for v in attn_quat_wxyz)
-        arena.worldbody.append(ET.Element("camera", attrib={
-            "name": ATTN_CAM_NAME,
-            "mode": "fixed",
-            "pos":  attn_pos_str,
-            "quat": attn_quat_str,
-            "fovy": str(ATTN_CAM_FOVY),
-        }))
 
         # Pale yellow cube — low friction for smooth gliding
         self.cubeG = BoxObject(
@@ -255,16 +235,6 @@ class FrankaCubePushEnv(ManipulationEnv):
         f = self.get_focal_length()
         return cam_pos, cam_R, f, self.camera_width, self.camera_height
 
-    def get_attn_camera_params(self):
-        """Return (cam_pos, cam_R, f, W, H) for the attention camera."""
-        cam_id = self.sim.model.camera_name2id(ATTN_CAM_NAME)
-        cam_pos = self.sim.model.cam_pos[cam_id].copy()
-        wxyz = self.sim.model.cam_quat[cam_id].copy()
-        q_xyzw = np.array([wxyz[1], wxyz[2], wxyz[3], wxyz[0]])
-        cam_R = Rotation.from_quat(q_xyzw).as_matrix()
-        f = (self.camera_height / 2.0) / np.tan(np.deg2rad(ATTN_CAM_FOVY) / 2.0)
-        return cam_pos, cam_R, f, self.camera_width, self.camera_height
-
     def world_to_pixel(self, point_3d, fovy=CAMERA_FOVY):
         """
         Project a 3D world point to (u, v) pixel coordinates in the thirdview camera.
@@ -286,27 +256,6 @@ class FrankaCubePushEnv(ManipulationEnv):
         # so we must mirror v to match the flipped frame.
         v = int(round(H - 1 - v_gl))
         return u, v
-
-    def attn_world_to_pixel(self, point_3d):
-        """Project a 3D world point to (u, v) pixel coords in the attention camera."""
-        W, H = self.camera_width, self.camera_height
-        cam_id = self.sim.model.camera_name2id(ATTN_CAM_NAME)
-        cam_pos = self.sim.model.cam_pos[cam_id].copy()
-        wxyz = self.sim.model.cam_quat[cam_id].copy()
-        q_xyzw = np.array([wxyz[1], wxyz[2], wxyz[3], wxyz[0]])
-        cam_R = Rotation.from_quat(q_xyzw).as_matrix()
-        p_cam = cam_R.T @ (point_3d - cam_pos)
-        f = (H / 2.0) / np.tan(np.deg2rad(ATTN_CAM_FOVY) / 2.0)
-        u_gl = -f * p_cam[0] / p_cam[2] + W / 2.0
-        v_gl = -f * p_cam[1] / p_cam[2] + H / 2.0
-        u = int(round(u_gl))
-        v = int(round(H - 1 - v_gl))
-        return u, v
-
-    def get_attention_frame(self, obs):
-        """RGB frame from the attention camera (behind cube, gripper-free view)."""
-        frame = obs[f"{ATTN_CAM_NAME}_image"]
-        return frame[::-1].copy()
 
     def get_frame(self, obs):
         """Return the current (H, W, 3) uint8 RGB camera frame from observations."""
