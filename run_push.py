@@ -23,6 +23,10 @@ Pipeline per episode:
                — i.e. the cube has translated up and out of the window.
                On the trigger, re-run SAM3 on the current thirdview frame
                and report the cube's 3D position from sim ground truth.
+  6. Phase C : grasp demo (lift → open → query env.get_cube_pos() → move
+               over cube → descend → close → final lift → hold).  The push
+               phases (A/B1/B2) never use cube 3D coords; the grasp uses
+               the simulator's actual cube pose.
 
 The cube's 3D height is never used for control — only the EEF's own
 (kinematically known) depth and the camera intrinsics + extrinsics.  The
@@ -50,7 +54,7 @@ import numpy as np
 import imageio
 import cv2
 
-from cube_push_env import FrankaCubePushEnv, TABLE_SURFACE_Z
+from cube_push_env import FrankaCubePushEnv, TABLE_SURFACE_Z, CUBE_HALF
 from segmentation import load_sam3_model, segment_cube_sam3
 from servoing import pixel_to_world_at_z
 
@@ -104,6 +108,17 @@ WHITE_MIN_RISE = 20              # absolute minimum rise in white count from
                                  # the initial frame already happened to have
                                  # mostly table (cube barely in window)
 
+# --- Phase C: hardcoded grasp after servo stops ---
+# After Phase B2 contact, lift up + open gripper, THEN navigate to the
+# cube's actual ground-truth pose (env.get_cube_pos()) and grasp.  The
+# servo phases (A/B1/B2) never used any cube 3D coords; the grasp is a
+# separate demo step that uses the simulator's true cube pose.
+GRASP_LIFT_DZ      = 0.10   # m: lift relative to post-contact tip
+GRASP_HOVER_DZ     = 0.10   # m: hover above cube top before descending
+GRIPPER_HOLD_STEPS = 15     # steps to settle open/close
+GRASP_FINAL_DZ     = 0.15   # m: final demonstration lift above cube
+POST_GRASP_HOLD    = 20     # ~1 s @ 20 fps
+
 
 # ---------------------------------------------------------------------------
 # Robot motion helpers  (unchanged)
@@ -136,13 +151,17 @@ def hold(env, obs, n_steps, gripper=-1.0):
 # Debug overlay
 # ---------------------------------------------------------------------------
 
-def draw_debug_overlay(frame, mask, centroid_px, attn_anchor_px, eef_px=None):
-    """Overlay keypoints, attention rectangle, and EEF dot (no mask fill in video)."""
+def draw_debug_overlay(frame, mask, contact_px, attn_anchor_px, eef_px=None):
+    """Overlay contact-target dot, attention rectangle, and tip dot.
+
+    contact_px is the front-face-top pixel (sam3_bottom_px) — where the
+    gripper tip should make contact with the cube.  Drawn red.
+    """
     vis = frame.copy()
 
-    # Centroid dot (red)
-    if centroid_px is not None:
-        cv2.circle(vis, centroid_px, 5, (255, 50, 50), -1)
+    # Contact-target dot (red): where the eef tip should touch the cube
+    if contact_px is not None:
+        cv2.circle(vis, contact_px, 5, (255, 50, 50), -1)
 
     # Attention window rectangle (green)
     if attn_anchor_px is not None:
@@ -280,7 +299,7 @@ def run_episode(env, processor, out_dir):
 
     def record(obs, eef_px=None):
         frame = env.get_frame(obs)
-        vis = draw_debug_overlay(frame, sam3_mask, centroid_px, attn_anchor_px, eef_px)
+        vis = draw_debug_overlay(frame, sam3_mask, sam3_bottom_px, attn_anchor_px, eef_px)
         thirdview_frames.append(vis)
 
         crop = frame[ady1:ady2, adx1:adx2]
@@ -449,6 +468,62 @@ def run_episode(env, processor, out_dir):
         cube_now = env.get_cube_pos()
         print(f"  cube position at end : {cube_now.round(4)}")
         print(f"  cube delta from start: {(cube_now - actual_cube).round(4)}")
+
+    # ------------------------------------------------------------------
+    # Phase C: grasp demo using the cube's actual ground-truth pose.
+    #   C1 lift (closed)  → C2 open  → C3 query cube pose, move over cube
+    #   → C4 descend onto cube → C5 close → C6 final lift → C7 hold
+    # ------------------------------------------------------------------
+    print("\n--- Phase C: grasp using actual cube pose ---")
+    tip0 = env.get_gripper_tip_pos()
+
+    # C1: lift straight up (gripper still closed from Phase B2)
+    lift_target = tip0 + np.array([0.0, 0.0, GRASP_LIFT_DZ])
+    print(f"  C1 lift  → {lift_target.round(3)}")
+    for obs in step_toward(env, obs, lift_target, gripper=1.0, max_steps=80):
+        record(obs, env.world_to_pixel(env.get_gripper_tip_pos()))
+
+    # C2: open gripper in place
+    print("  C2 open gripper")
+    for obs in hold(env, obs, n_steps=GRIPPER_HOLD_STEPS, gripper=-1.0):
+        record(obs, env.world_to_pixel(env.get_gripper_tip_pos()))
+
+    # C3: query the cube's actual pose AFTER the push and move horizontally
+    # to hover above it (preserving the lifted Z so we don't graze the cube).
+    cube_pose = env.get_cube_pos()
+    hover_z = max(lift_target[2], cube_pose[2] + GRASP_HOVER_DZ)
+    over_cube = np.array([cube_pose[0], cube_pose[1], hover_z])
+    print(f"  cube actual pose = {cube_pose.round(4)}")
+    print(f"  C3 over cube → {over_cube.round(3)}")
+    for obs in step_toward(env, obs, over_cube, gripper=-1.0, max_steps=120):
+        record(obs, env.world_to_pixel(env.get_gripper_tip_pos()))
+
+    # C4: descend to actual cube center Z so the open fingers straddle the cube
+    descend_target = np.array([cube_pose[0], cube_pose[1], cube_pose[2]])
+    print(f"  C4 descend → {descend_target.round(3)}")
+    for obs in step_toward(env, obs, descend_target, gripper=-1.0, max_steps=120):
+        record(obs, env.world_to_pixel(env.get_gripper_tip_pos()))
+
+    # C5: close gripper to clamp cube
+    print("  C5 close gripper")
+    for obs in hold(env, obs, n_steps=GRIPPER_HOLD_STEPS, gripper=1.0):
+        record(obs, env.world_to_pixel(env.get_gripper_tip_pos()))
+
+    # C6: lift to demonstrate grasp
+    final_target = descend_target + np.array([0.0, 0.0, GRASP_FINAL_DZ])
+    print(f"  C6 final lift → {final_target.round(3)}")
+    for obs in step_toward(env, obs, final_target, gripper=1.0, max_steps=120):
+        record(obs, env.world_to_pixel(env.get_gripper_tip_pos()))
+
+    # C7: hold so the held cube is visible at end of video
+    print("  C7 hold")
+    for obs in hold(env, obs, n_steps=POST_GRASP_HOLD, gripper=1.0):
+        record(obs, env.world_to_pixel(env.get_gripper_tip_pos()))
+
+    cube_final = env.get_cube_pos()
+    print(f"  pre-grasp cube z = {cube_pose[2]:.4f}, "
+          f"post-grasp cube z = {cube_final[2]:.4f}, "
+          f"lift Δz = {cube_final[2] - cube_pose[2]:+.4f} m")
 
     print(f"\nTotal frames: {len(thirdview_frames)}")
     return thirdview_frames, attention_frames, sideview_frames
