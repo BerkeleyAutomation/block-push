@@ -21,12 +21,18 @@ CAMERA_POS = np.array([0.0, -1.1, 1.4])
 CAMERA_TARGET = np.array([0.0, 0.0, 0.85])
 CAMERA_FOVY = 45.0
 
+# Side-view camera: perpendicular to thirdview (which looks along +Y).
+# Placed on the +X side looking back toward the workspace center.
+SIDEVIEW_NAME = "sideview_cam"
+SIDEVIEW_POS = np.array([1.1, 0.0, 1.4])
+SIDEVIEW_TARGET = np.array([0.0, 0.0, 0.85])
+
 TABLE_SIZE = (0.8, 0.8, 0.05)
 TABLE_OFFSET = np.array([0.0, 0.0, 0.8])
 TABLE_SURFACE_Z = TABLE_OFFSET[2]
 
 # Cube half-extent and initial placement
-CUBE_HALF = 0.025
+CUBE_HALF = 0.035  # 7 cm cube
 # Green cube placed in front of table center (toward camera, -Y)
 CUBE_POS = np.array([0.0, -0.10, TABLE_SURFACE_Z + CUBE_HALF])
 
@@ -101,9 +107,9 @@ class FrankaCubePushEnv(ManipulationEnv):
             use_camera_obs=use_camera_obs,
             has_renderer=has_renderer,
             has_offscreen_renderer=has_offscreen_renderer,
-            camera_names=[CAMERA_NAME],
-            camera_heights=[camera_height],
-            camera_widths=[camera_width],
+            camera_names=[CAMERA_NAME, SIDEVIEW_NAME],
+            camera_heights=[camera_height, camera_height],
+            camera_widths=[camera_width, camera_width],
             camera_depths=False,
             **kwargs,
         )
@@ -126,18 +132,22 @@ class FrankaCubePushEnv(ManipulationEnv):
         )
         arena.set_origin([0, 0, 0])
 
-        # Add fixed camera via XML
-        cam_quat_wxyz = _look_at_quat_wxyz(CAMERA_POS, CAMERA_TARGET)
-        pos_str = " ".join(f"{v:.4f}" for v in CAMERA_POS)
-        quat_str = " ".join(f"{v:.6f}" for v in cam_quat_wxyz)
-        camera_elem = ET.Element("camera", attrib={
-            "name": CAMERA_NAME,
-            "mode": "fixed",
-            "pos": pos_str,
-            "quat": quat_str,
-            "fovy": str(CAMERA_FOVY),
-        })
-        arena.worldbody.append(camera_elem)
+        # Add fixed cameras via XML (thirdview + sideview perpendicular to it)
+        for cam_name, cam_pos, cam_target in (
+            (CAMERA_NAME, CAMERA_POS, CAMERA_TARGET),
+            (SIDEVIEW_NAME, SIDEVIEW_POS, SIDEVIEW_TARGET),
+        ):
+            cam_quat_wxyz = _look_at_quat_wxyz(cam_pos, cam_target)
+            pos_str = " ".join(f"{v:.4f}" for v in cam_pos)
+            quat_str = " ".join(f"{v:.6f}" for v in cam_quat_wxyz)
+            camera_elem = ET.Element("camera", attrib={
+                "name": cam_name,
+                "mode": "fixed",
+                "pos": pos_str,
+                "quat": quat_str,
+                "fovy": str(CAMERA_FOVY),
+            })
+            arena.worldbody.append(camera_elem)
 
         # Pale yellow cube — low friction for smooth gliding
         self.cubeG = BoxObject(
@@ -208,6 +218,18 @@ class FrankaCubePushEnv(ManipulationEnv):
         """World-space position of the green cube."""
         return np.array(self.sim.data.body_xpos[self.cubeG_body_id])
 
+    def get_gripper_tip_pos(self):
+        """World-space position of the gripper fingertip pinch point.
+
+        Uses the robosuite-registered eef site (set from the Panda gripper
+        URDF), which sits at the midpoint between the two fingertips —
+        distinct from obs["robot0_eef_pos"], which is the controller
+        reference body and lives further up the wrist.
+        """
+        # robosuite 1.5 maps eef_site_id by arm name (e.g., {"right": <id>}).
+        site_id = self.robots[0].eef_site_id["right"]
+        return np.array(self.sim.data.site_xpos[site_id])
+
     def get_camera_extrinsics(self):
         """
         Returns (cam_pos, cam_R) where cam_R is a 3×3 matrix whose columns are
@@ -261,5 +283,10 @@ class FrankaCubePushEnv(ManipulationEnv):
         """Return the current (H, W, 3) uint8 RGB camera frame from observations."""
         frame = obs[f"{CAMERA_NAME}_image"]
         # Robosuite returns images as uint8; flip vertically (OpenGL → top-down)
+        return frame[::-1].copy()
+
+    def get_sideview_frame(self, obs):
+        """Return the current (H, W, 3) uint8 RGB sideview camera frame."""
+        frame = obs[f"{SIDEVIEW_NAME}_image"]
         return frame[::-1].copy()
       

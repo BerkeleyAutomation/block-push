@@ -8,13 +8,17 @@ window.
 
 Pipeline per episode:
   1. Reset env, capture first thirdview frame
-  2. SAM3 on thirdview frame → cube mask + centroid + bottom-edge anchor
-  3. Phase A : move EEF to APPROACH_HEIGHT above the table at current EEF XY
+  2. SAM3 on thirdview frame → cube mask + centroid + bottom-edge anchor.
+     Phases B1/B2 servo to the mask BOTTOM-edge midpoint (front-face-top
+     of the cube) so the gripper tip lands on the front face of the cube;
+     the centroid is shown only for diagnostics.
+  3. Phase A : move EEF to APPROACH_HEIGHT above the table at current tip XY
   4. Phase B1: image-space XY alignment — at each step solve for the world XY
-               (at the EEF's CURRENT Z) that projects to the cube's pixel;
-               step toward it until the EEF pixel is within STOP_PIXEL_THRESHOLD
-  5. Phase B2: descend along the thirdview camera ray (keeps cube pixel
-               locked) until the cube's yellow pixels in the 20×20 window
+               (at the gripper tip's CURRENT Z) that projects to the cube's
+               front-face-top pixel; step toward it until the tip pixel is
+               within STOP_PIXEL_THRESHOLD
+  5. Phase B2: descend along the thirdview camera ray (keeps front-face-top
+               pixel locked) until the cube's yellow pixels in the 20×20 window
                crop drop below YELLOW_DROP_FRACTION of their initial count
                — i.e. the cube has translated up and out of the window.
                On the trigger, re-run SAM3 on the current thirdview frame
@@ -29,6 +33,9 @@ Outputs (per invocation, written to results/run_<N>/):
   thirdview.mp4         — third-view recording with SAM3/EEF overlays
   attention.mp4         — 20×20 thirdview crop of the attention window,
                           upscaled 12×
+  sideview.mp4          — perpendicular side-view camera (visual sanity
+                          check that the gripper tip contacts the cube
+                          front face at the correct height)
   debug_first_frame.png — raw thirdview at start of episode
   debug_sam3.png        — SAM3 mask + 20×20 attention window on thirdview
 
@@ -63,7 +70,7 @@ DETECT_HALF = 6      # 20×20 crop used for contact detection
 # the table strip just below the cube.  When the cube is pushed in +Y
 # (away from camera), the cube image translates UP and exits the window
 # from the top, leaving pure table content behind.
-WINDOW_DROP_PX = 22
+WINDOW_DROP_PX = 31  # tuned for CUBE_HALF=0.035 (7 cm cube)
 
 # ---------------------------------------------------------------------------
 # Servoing parameters — purely image-space alignment + camera-ray descent.
@@ -103,10 +110,10 @@ WHITE_MIN_RISE = 20              # absolute minimum rise in white count from
 # ---------------------------------------------------------------------------
 
 def step_toward(env, obs, target_pos, gripper=-1.0, max_steps=80, tol=0.005):
-    """Move EEF toward target_pos; yields obs after each step."""
+    """Move gripper tip toward target_pos; yields obs after each step."""
     for _ in range(max_steps):
-        eef_pos = obs["robot0_eef_pos"]
-        err = target_pos - eef_pos
+        tip_pos = env.get_gripper_tip_pos()
+        err = target_pos - tip_pos
         if np.linalg.norm(err) < tol:
             break
         action = np.zeros(7)
@@ -233,6 +240,11 @@ def run_episode(env, processor, out_dir):
     print(f"  centroid_px={centroid_px}  sam3_bottom_px={sam3_bottom_px}  "
           f"attn_window_px={attn_anchor_px}")
 
+    eef_ref = obs["robot0_eef_pos"]
+    tip = env.get_gripper_tip_pos()
+    print(f"  [diag] eef_ref={eef_ref.round(4)}  tip={tip.round(4)}  "
+          f"delta={(tip - eef_ref).round(4)}")
+
     # === DIAGNOSTIC: compare SAM3 detection to ground-truth pixel projection ===
     actual_cube = env.get_cube_pos()
     actual_third_px = env.world_to_pixel(actual_cube)
@@ -264,6 +276,7 @@ def run_episode(env, processor, out_dir):
     # ------------------------------------------------------------------
     thirdview_frames = []
     attention_frames = []  # each frame is the 20×20 crop, upscaled at save
+    sideview_frames = []   # perpendicular camera, for visual verification
 
     def record(obs, eef_px=None):
         frame = env.get_frame(obs)
@@ -277,6 +290,8 @@ def run_episode(env, processor, out_dir):
         if ph > 0 or pw > 0:
             crop = np.pad(crop, ((0, ph), (0, pw), (0, 0)))
         attention_frames.append(crop)
+
+        sideview_frames.append(env.get_sideview_frame(obs))
         return frame
 
     record(obs)
@@ -286,11 +301,11 @@ def run_episode(env, processor, out_dir):
     # No cube coords used — we just lift to a known-safe height before servoing.
     # ------------------------------------------------------------------
     print("\n--- Phase A: lift to approach height ---")
-    eef_now = obs["robot0_eef_pos"]
-    above_3d = np.array([eef_now[0], eef_now[1], TABLE_SURFACE_Z + APPROACH_HEIGHT])
-    print(f"  current EEF={eef_now.round(3)}  above_target={above_3d.round(3)}")
+    tip_now = env.get_gripper_tip_pos()
+    above_3d = np.array([tip_now[0], tip_now[1], TABLE_SURFACE_Z + APPROACH_HEIGHT])
+    print(f"  current tip={tip_now.round(3)}  above_target={above_3d.round(3)}")
     for obs in step_toward(env, obs, above_3d, gripper=1.0, max_steps=100):
-        eef_px = env.world_to_pixel(obs["robot0_eef_pos"])
+        eef_px = env.world_to_pixel(env.get_gripper_tip_pos())
         record(obs, eef_px)
 
     # ------------------------------------------------------------------
@@ -302,25 +317,25 @@ def run_episode(env, processor, out_dir):
     # ------------------------------------------------------------------
     print("\n--- Phase B1: image-space XY alignment ---")
     for step_i in range(PHASE1_MAX_STEPS):
-        eef_pos = obs["robot0_eef_pos"]
-        eef_z = float(eef_pos[2])
+        tip_pos = env.get_gripper_tip_pos()
+        tip_z = float(tip_pos[2])
         target_world = pixel_to_world_at_z(
-            centroid_px[0], centroid_px[1], eef_z,
+            sam3_bottom_px[0], sam3_bottom_px[1], tip_z,
             cam_pos, cam_R, f, W, H,
         )
-        target_world[2] = eef_z  # alignment is pure XY — preserve Z
-        err = target_world - eef_pos
+        target_world[2] = tip_z  # alignment is pure XY — preserve Z
+        err = target_world - tip_pos
         action = np.zeros(7)
         action[:3] = np.clip(err / 0.05, -1.0, 1.0)
-        action[6] = -1.0
+        action[6] = 1.0  # keep gripper closed so fingers stay at the tip site
         obs, _, _, _ = env.step(action)
-        eef_px = env.world_to_pixel(obs["robot0_eef_pos"])
+        eef_px = env.world_to_pixel(env.get_gripper_tip_pos())
         record(obs, eef_px)
 
-        pix_err = float(np.hypot(eef_px[0] - centroid_px[0],
-                                 eef_px[1] - centroid_px[1]))
+        pix_err = float(np.hypot(eef_px[0] - sam3_bottom_px[0],
+                                 eef_px[1] - sam3_bottom_px[1]))
         if step_i % 5 == 0:
-            print(f"  step={step_i:3d}  EEF px={eef_px}  cube px={centroid_px}  "
+            print(f"  step={step_i:3d}  tip px={eef_px}  front-face px={sam3_bottom_px}  "
                   f"pix_err={pix_err:.1f}")
         if pix_err < STOP_PIXEL_THRESHOLD:
             print(f"====== ALIGNED at step {step_i}  pix_err={pix_err:.1f} ======")
@@ -335,16 +350,17 @@ def run_episode(env, processor, out_dir):
     # image differencing + Farneback optical flow.
     # ------------------------------------------------------------------
     print("\n--- Phase B2: camera-ray descent ---")
-    # Ray direction in camera frame for the cube pixel.  Same convention as
-    # pixel_to_world_at_z: p_cam[0] = ax_ray*z, p_cam[1] = ay_ray*z, p_cam[2] = z.
-    u_cube, v_cube = centroid_px
+    # Ray direction in camera frame for the front-face-top pixel.  Same
+    # convention as pixel_to_world_at_z: p_cam[0] = ax_ray*z,
+    # p_cam[1] = ay_ray*z, p_cam[2] = z.
+    u_cube, v_cube = sam3_bottom_px
     v_gl = H - 1 - v_cube
     ax_ray = -(u_cube - W / 2.0) / f
     ay_ray = -(v_gl - H / 2.0) / f
 
     contact_confirmed = False
-    start_z = obs["robot0_eef_pos"][2]
-    print(f"  start EEF z={start_z:.4f}, ray=({ax_ray:+.3f}, {ay_ray:+.3f})")
+    start_z = float(env.get_gripper_tip_pos()[2])
+    print(f"  start tip z={start_z:.4f}, ray=({ax_ray:+.3f}, {ay_ray:+.3f})")
 
     window_total_px = (ady2 - ady1) * (adx2 - adx1)
 
@@ -366,30 +382,30 @@ def run_episode(env, processor, out_dir):
           f"{window_total_px} px")
 
     for step_i in range(PHASE2_MAX_STEPS):
-        eef_pos = obs["robot0_eef_pos"]
-        # Current EEF camera-frame depth (negative; camera looks along -cam_Z).
-        p_cam_eef = cam_R.T @ (eef_pos - cam_pos)
+        tip_pos = env.get_gripper_tip_pos()
+        # Current tip camera-frame depth (negative; camera looks along -cam_Z).
+        p_cam_eef = cam_R.T @ (tip_pos - cam_pos)
         # Step "deeper" along the ray: p_cam[2] becomes more negative.
         z_cam_target = float(p_cam_eef[2]) - SERVO_DZ
         target_cam = np.array([ax_ray * z_cam_target,
                                ay_ray * z_cam_target,
                                z_cam_target])
         target_world = cam_pos + cam_R @ target_cam
-        err = target_world - eef_pos
+        err = target_world - tip_pos
         action = np.zeros(7)
         action[:3] = np.clip(err / 0.05, -1.0, 1.0)
-        action[6] = -1.0
+        action[6] = 1.0  # keep gripper closed so fingers stay at the tip site
         obs, _, _, _ = env.step(action)
-        frame = record(obs, env.world_to_pixel(obs["robot0_eef_pos"]))
+        frame = record(obs, env.world_to_pixel(env.get_gripper_tip_pos()))
 
         # 20×20 thirdview crop at the attention window
         crop_rgb = frame[ady1:ady2, adx1:adx2]
 
         if step_i % 25 == 0:
-            ep = obs['robot0_eef_pos']
-            eef_px_now = env.world_to_pixel(ep)
-            print(f"  step={step_i:3d}  EEF=({ep[0]:+.3f},{ep[1]:+.3f},{ep[2]:.3f})  "
-                  f"EEF px={eef_px_now}  cube px={centroid_px}")
+            tp = env.get_gripper_tip_pos()
+            tip_px_now = env.world_to_pixel(tp)
+            print(f"  step={step_i:3d}  tip=({tp[0]:+.3f},{tp[1]:+.3f},{tp[2]:.3f})  "
+                  f"tip px={tip_px_now}  front-face px={sam3_bottom_px}")
 
         if step_i >= PHASE2_WARMUP_STEPS:
             wc = white_count(crop_rgb)
@@ -402,7 +418,7 @@ def run_episode(env, processor, out_dir):
                       f"rise>{WHITE_MIN_RISE})")
             if frac > WHITE_TRIGGER_FRACTION and rise > WHITE_MIN_RISE:
                 print(f"\n--- Cube exited attention window at step {step_i}, "
-                      f"EEF z={obs['robot0_eef_pos'][2]:.4f} ---")
+                      f"tip z={env.get_gripper_tip_pos()[2]:.4f} ---")
                 print(f"  white_count: {initial_white_count} → {wc}  "
                       f"(frac {frac:.2f}, rise {rise:+d})")
                 # SAM3 re-segmentation on the current thirdview frame, so
@@ -429,13 +445,13 @@ def run_episode(env, processor, out_dir):
                 break
 
     if not contact_confirmed:
-        print(f"[Phase B2] Max iterations reached.  EEF z={obs['robot0_eef_pos'][2]:.4f}")
+        print(f"[Phase B2] Max iterations reached.  tip z={env.get_gripper_tip_pos()[2]:.4f}")
         cube_now = env.get_cube_pos()
         print(f"  cube position at end : {cube_now.round(4)}")
         print(f"  cube delta from start: {(cube_now - actual_cube).round(4)}")
 
     print(f"\nTotal frames: {len(thirdview_frames)}")
-    return thirdview_frames, attention_frames
+    return thirdview_frames, attention_frames, sideview_frames
 
 
 # ---------------------------------------------------------------------------
@@ -494,13 +510,16 @@ def main():
         ignore_done=True,
     )
 
-    thirdview_frames, attention_frames = run_episode(env, processor, out_dir)
+    thirdview_frames, attention_frames, sideview_frames = run_episode(
+        env, processor, out_dir
+    )
     env.close()
 
     print("\nSaving videos...")
     save_video(thirdview_frames, str(out_dir / "thirdview.mp4"), FPS)
     save_video(attention_frames, str(out_dir / "attention.mp4"), FPS,
                upscale=ATTN_VIDEO_UPSCALE)
+    save_video(sideview_frames, str(out_dir / "sideview.mp4"), FPS)
     print(f"\nDone. All outputs in {out_dir}/")
 
 
